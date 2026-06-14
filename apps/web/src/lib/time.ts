@@ -3,7 +3,7 @@
  * Import from $lib/time instead of using raw toLocaleTimeString/DateString directly.
  */
 
-const GY_TZ = 'Europe/London';
+export const GY_TZ = 'Europe/London';
 
 /** Format a date/time as HH:MM in Guernsey local time. */
 export function formatGuernseyTime(date: string | Date | null | undefined): string {
