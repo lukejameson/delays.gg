@@ -4,7 +4,7 @@
   "description": "Health monitoring service — SQL integrity checks + LLM cross-signal correlation for airways.gg",
   "main": "dist/index.js",
   "scripts": {
-    "build": "tsc",
+    "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
     "dev": "tsc && node dist/index.js",
     "test": "vitest run",
