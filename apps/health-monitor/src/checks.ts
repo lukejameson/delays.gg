@@ -7,7 +7,6 @@ import {
   pushSubscriptions,
   weatherData,
 } from '@airways/database/schema';
-import { isTerminalStatus } from '@airways/database';
 import { sql, eq, and, gte, desc } from 'drizzle-orm';
 
 export interface CheckResult {
@@ -19,21 +18,23 @@ export interface CheckResult {
 }
 
 // ── Service list ───────────────────────────────────────────────────
+// Logical service names (our keys) → actual DB scraper_logs.service values.
+// Only services that write to scraper_logs are included here.
+// Other services (position, weather, notification) are monitored via their
+// respective data-table recency checks (position_gap, stale_weather, watermark_lag).
+const SCRAPER_SERVICES: { key: string; dbValue: string; staleMins: number }[] = [
+  { key: 'guernsey', dbValue: 'guernsey_live', staleMins: parseInt(process.env.STALE_GUERNSEY_MINS ?? '30', 10) },
+  { key: 'fr24', dbValue: 'fr24_live', staleMins: parseInt(process.env.STALE_FR24_MINS ?? '30', 10) },
+];
 
-const SERVICE_NAMES = ['guernsey', 'fr24', 'position', 'weather', 'adsb', 'notification'] as const;
-type ServiceName = (typeof SERVICE_NAMES)[number];
+function staleThresholdMins(key: string): number {
+  const s = SCRAPER_SERVICES.find(s => s.key === key);
+  return s?.staleMins ?? 30;
+}
 
-function staleThresholdMins(service: ServiceName): number {
-  const envKey = `STALE_${service.toUpperCase()}_MINS`;
-  const defaults: Record<ServiceName, number> = {
-    guernsey: 30,
-    fr24: 30,
-    position: 15,
-    weather: 45,
-    adsb: 30,
-    notification: 5,
-  };
-  return parseInt(process.env[envKey] ?? String(defaults[service]), 10);
+function dbServiceName(key: string): string {
+  const s = SCRAPER_SERVICES.find(s => s.key === key);
+  return s?.dbValue ?? key;
 }
 
 // ── Error wrapper — per-check isolation ────────────────────────────
@@ -80,18 +81,18 @@ async function checkScraperStaleness(): Promise<CheckResult[]> {
     latestMap.set(row.service, new Date(row.started_at));
   }
 
-  for (const service of SERVICE_NAMES) {
-    const thresholdMins = staleThresholdMins(service);
+  for (const svc of SCRAPER_SERVICES) {
+    const thresholdMins = svc.staleMins;
     const thresholdMs = thresholdMins * 60 * 1000;
-    const latest = latestMap.get(service);
+    const latest = latestMap.get(svc.dbValue);
 
     if (!latest) {
       results.push({
-        name: `${service}_last_run`,
+        name: `${svc.key}_last_run`,
         passed: false,
         value: 'never',
         threshold: `${thresholdMins}m`,
-        samples: [{ service, reason: 'no scraper logs found' }],
+        samples: [{ service: svc.key, reason: 'no scraper logs found' }],
       });
       continue;
     }
@@ -99,12 +100,12 @@ async function checkScraperStaleness(): Promise<CheckResult[]> {
     const ageMs = now.getTime() - latest.getTime();
     const ageMins = Math.round(ageMs / 60000);
     results.push({
-      name: `${service}_last_run`,
+      name: `${svc.key}_last_run`,
       passed: ageMs < thresholdMs,
       value: `${ageMins}m ago`,
       threshold: `${thresholdMins}m`,
       ...(ageMs >= thresholdMs && {
-        samples: [{ service, lastStartedAt: latest.toISOString(), ageMins }],
+        samples: [{ service: svc.key, lastStartedAt: latest.toISOString(), ageMins }],
       }),
     });
   }
@@ -145,9 +146,9 @@ async function checkScraperFailureRate(): Promise<CheckResult[]> {
 
   const results: CheckResult[] = [];
 
-  for (const service of SERVICE_NAMES) {
-    const total = totals.get(service) ?? 0;
-    const failed = failures.get(service) ?? 0;
+  for (const svc of SCRAPER_SERVICES) {
+    const total = totals.get(svc.dbValue) ?? 0;
+    const failed = failures.get(svc.dbValue) ?? 0;
     const failRate = total > 0 ? ((failed / total) * 100).toFixed(0) : '0';
     const passed = failed <= 3;
 
@@ -162,7 +163,7 @@ async function checkScraperFailureRate(): Promise<CheckResult[]> {
         .from(scraperLogs)
         .where(
           and(
-            sql`${scraperLogs.service} = ${service}`,
+            sql`${scraperLogs.service} = ${svc.dbValue}`,
             eq(scraperLogs.status, 'failure'),
             gte(scraperLogs.startedAt, sixHoursAgo),
           ),
@@ -173,7 +174,7 @@ async function checkScraperFailureRate(): Promise<CheckResult[]> {
     }
 
     results.push({
-      name: `${service}_failure_rate_6h`,
+      name: `${svc.key}_failure_rate_6h`,
       passed,
       value: `${failed}/${total} (${failRate}%)`,
       threshold: '≤ 3 failures',
@@ -189,11 +190,11 @@ async function checkConsecutiveFailures(): Promise<CheckResult[]> {
   const db = getDb();
 
   const perService = await Promise.all(
-    SERVICE_NAMES.map(async (service) => {
+    SCRAPER_SERVICES.map(async (svc) => {
       const rows = await db
         .select({ status: scraperLogs.status, startedAt: scraperLogs.startedAt })
         .from(scraperLogs)
-        .where(sql`${scraperLogs.service} = ${service}`)
+        .where(sql`${scraperLogs.service} = ${svc.dbValue}`)
         .orderBy(desc(scraperLogs.startedAt))
         .limit(10);
 
@@ -205,7 +206,7 @@ async function checkConsecutiveFailures(): Promise<CheckResult[]> {
 
       const hasData = rows.length > 0;
       return {
-        name: `${service}_consecutive_failures` as string,
+        name: `${svc.key}_consecutive_failures` as string,
         passed: consecutive < 3,
         value: hasData ? `${consecutive}` : 'no data',
         threshold: '< 3' as string,
@@ -247,12 +248,12 @@ async function checkZeroRecords(): Promise<CheckResult[]> {
 
   const results: CheckResult[] = [];
 
-  for (const service of SERVICE_NAMES) {
-    const recent = byService.get(service) ?? [];
+  for (const svc of SCRAPER_SERVICES) {
+    const recent = byService.get(svc.dbValue) ?? [];
     const zeroCount = recent.filter((r) => (r.recordsScraped ?? 0) === 0).length;
 
     results.push({
-      name: `${service}_zero_records`,
+      name: `${svc.key}_zero_records`,
       passed: zeroCount === 0,
       value: `${zeroCount} of last ${Math.min(recent.length, 5)}`,
       threshold: 'none',
@@ -284,7 +285,7 @@ async function checkNullStatus(): Promise<CheckResult[]> {
     {
       name: 'null_status_today',
       passed: rows.length === 0,
-      value: `${rows.length} flights`,
+      value: rows.length >= 20 ? '20+ flights' : `${rows.length} flights`,
       threshold: 'none',
       ...(rows.length > 0 && {
         samples: rows.map((r) => ({ id: r.id, flightNumber: r.flightNumber, flightDate: r.flightDate })),
@@ -308,7 +309,7 @@ async function checkNegativeDelay(): Promise<CheckResult[]> {
     {
       name: 'negative_delay',
       passed: rows.length === 0,
-      value: `${rows.length} flights`,
+      value: rows.length >= 20 ? '20+ flights' : `${rows.length} flights`,
       threshold: 'none',
       ...(rows.length > 0 && {
         samples: rows.map((r) => ({ id: r.id, flightNumber: r.flightNumber, delayMinutes: r.delayMinutes })),
@@ -347,7 +348,7 @@ async function checkStaleFlights(): Promise<CheckResult[]> {
     {
       name: 'stale_updated_at',
       passed: rows.length === 0,
-      value: `${rows.length} flights`,
+      value: rows.length >= 20 ? '20+ flights' : `${rows.length} flights`,
       threshold: 'none older than 6h (last 7 days)',
       ...(rows.length > 0 && {
         samples: rows.map((r) => ({
@@ -380,7 +381,7 @@ async function checkOrphanedFlightTimes(): Promise<CheckResult[]> {
     {
       name: 'orphaned_flight_times',
       passed: count === 0,
-      value: `${count} rows`,
+      value: count >= 20 ? '20+ rows' : `${count} rows`,
       threshold: 'none (last 7 days)',
       ...(count > 0 && { samples: rows.rows.slice(0, 20) }),
     },
@@ -623,9 +624,13 @@ async function checkStaleWeatherCheck(): Promise<CheckResult[]> {
   const now = new Date();
 
   const rows = await db.execute(sql`
-    SELECT DISTINCT ON (airport_code) airport_code, timestamp
-    FROM weather_data
-    ORDER BY airport_code, timestamp DESC
+    SELECT DISTINCT ON (wd.airport_code) wd.airport_code, wd.timestamp
+    FROM weather_data wd
+    INNER JOIN flights f ON (
+      f.departure_airport = wd.airport_code OR f.arrival_airport = wd.airport_code
+    )
+    WHERE f.flight_date >= CURRENT_DATE - INTERVAL '7 days'
+    ORDER BY wd.airport_code, wd.timestamp DESC
   `);
 
   const results: CheckResult[] = [];
@@ -661,7 +666,7 @@ async function checkStaleWeatherCheck(): Promise<CheckResult[]> {
 // ── Aggregated Runners ─────────────────────────────────────────────
 
 export async function runScraperChecks(): Promise<CheckResult[]> {
-  return safeCheck('scraper_staleness', 'varies', async () => {
+  return safeCheck('scraper_checks', 'varies', async () => {
     const [staleness, failureRate, consecutive, zeroRecords] = await Promise.all([
       checkScraperStaleness(),
       checkScraperFailureRate(),

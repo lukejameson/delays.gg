@@ -8,16 +8,30 @@ import { sendAlert } from '@airways/telegram';
 const TIER1_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
 const TIER2_INTERVAL_HOURS = 2;
 const HEARTBEAT_INTERVAL_HOURS = 6;
-const HEARTBEAT_INTERVAL_MS = HEARTBEAT_INTERVAL_HOURS * 60 * 60 * 1000;
 
 // Service name prefixes that may appear in check names like "guernsey_last_run"
 const SERVICE_PREFIXES = ['guernsey_', 'fr24_', 'position_', 'weather_', 'adsb_', 'notification_'];
+
+/** Escape Telegram Markdown special characters so check names render literally. */
+function escapeMd(text: string): string {
+  return text.replace(/([_*[\]()~`>#+\-=|{}.!])/g, '\\$1');
+}
 
 function stripServicePrefix(name: string): string {
   for (const prefix of SERVICE_PREFIXES) {
     if (name.startsWith(prefix)) return name.slice(prefix.length);
   }
   return name;
+}
+
+/** Human-readable label for a check name, with service prefix stripped and context added. */
+function checkLabel(c: CheckResult): string {
+  const raw = c.name;
+  // position_gap → position gap
+  if (raw === 'position_gap') return 'position gap';
+  if (raw === 'weather_gaps') return 'weather gaps';
+  if (raw === 'stale_weather') return 'stale weather';
+  return stripServicePrefix(raw);
 }
 
 function buildTelegramMessage(
@@ -77,7 +91,14 @@ function buildTelegramMessage(
       const displayName = categoryDisplayName(category);
       lines.push(`*${displayName}*`);
       for (const c of catFailed) {
-        lines.push(`  🔴 ${stripServicePrefix(c.name)}: ${c.value} (threshold: ${c.threshold})`);
+        const label = escapeMd(checkLabel(c));
+        const val = escapeMd(c.value);
+        const thr = escapeMd(c.threshold);
+        lines.push(`  🔴 ${label}: ${val} (threshold: ${thr})`);
+        // Show error details if this check errored out
+        if (c.value === 'error' && c.samples?.[0]?.error) {
+          lines.push(`    \`${escapeMd(String(c.samples[0].error).slice(0, 200))}\``);
+        }
       }
       lines.push('');
     }
@@ -189,12 +210,10 @@ async function main() {
     // Heartbeat: send an "all clear" periodically to prove the monitor is alive.
     // Only fire if enough time has passed since the last heartbeat.
     if (cycleIndex - lastHeartbeatCycle >= HEARTBEAT_INTERVAL_HOURS) {
-      const allPassed = (await runAllChecks().catch(() => [] as CheckResult[])).every(
-        (c) => c.passed,
-      );
-      if (allPassed) {
+      const heartbeatChecks = await runAllChecks().catch(() => [] as CheckResult[]);
+      if (heartbeatChecks.every((c) => c.passed)) {
         const heartbeatMsg = buildTelegramMessage(
-          [],
+          heartbeatChecks,
           null,
           cycleTime,
           true,

@@ -64,10 +64,21 @@
     return entry?.timeValue ?? null;
   });
 
+  // Actual times: prefer flights table, fall back to flight_times (FR24 writes
+  // ActualBlockOff/ActualBlockOn even when guernsey-scraper hasn't set the column)
+  const actualDeparture = $derived.by(() => {
+    if (flight.actualDeparture) return flight.actualDeparture;
+    const entry = times?.find((t: { timeType: string }) => t.timeType === 'ActualBlockOff');
+    return entry?.timeValue ?? null;
+  });
+  const actualArrival = $derived.by(() => {
+    if (flight.actualArrival) return flight.actualArrival;
+    const entry = times?.find((t: { timeType: string }) => t.timeType === 'ActualBlockOn');
+    return entry?.timeValue ?? null;
+  });
+
   // Destructure flight for template use
   const scheduledDeparture = $derived(flight.scheduledDeparture);
-  const actualDeparture = $derived(flight.actualDeparture);
-  const actualArrival = $derived(flight.actualArrival);
 
   // SEO
   const seoTitle = $derived(`${flight.flightNumber}: ${airportName(flight.departureAirport)} → ${airportName(flight.arrivalAirport)} | airways.gg`);

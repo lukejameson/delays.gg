@@ -195,16 +195,50 @@ async function fetchAllMetars(airports: { code: string; icao: string }[]): Promi
   return results;
 }
 
+async function fetchTafBatch(icaos: string[], airportByIcao: Map<string, { code: string; icao: string }>, retries = 2): Promise<Map<string, WeatherRow[]>> {
+  const url = `${AVIATION_WEATHER_BASE}/taf?ids=${icaos.join(',')}&hours=24`;
+
+  let lastErr: Error | undefined;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const res = await fetch(url, { signal: AbortSignal.timeout(30_000) });
+      if (!res.ok) throw new Error(`AviationWeather TAF ${res.status}`);
+      return parseTafResponse(await res.text(), airportByIcao);
+    } catch (err) {
+      lastErr = err as Error;
+      if (attempt < retries) {
+        const delay = (attempt + 1) * 2000;
+        console.log(`[Weather] TAF fetch attempt ${attempt + 1} failed, retrying in ${delay}ms...`);
+        await new Promise(r => setTimeout(r, delay));
+      }
+    }
+  }
+  throw lastErr;
+}
+
 async function fetchAllTafs(airports: { code: string; icao: string }[]): Promise<Map<string, WeatherRow[]>> {
-  const icaos = airports.map(a => a.icao).join(',');
-  const url = `${AVIATION_WEATHER_BASE}/taf?ids=${icaos}&hours=24`;
-  // Create lookup map for faster access
   const airportByIcao = new Map(airports.map(a => [a.icao, a]));
+  const icaos = airports.map(a => a.icao);
 
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`AviationWeather TAF ${res.status}`);
+  // Fetch in batches of 5 ICAOs to reduce request size and timeout risk
+  const BATCH = 5;
+  const results = new Map<string, WeatherRow[]>();
+  for (let i = 0; i < icaos.length; i += BATCH) {
+    const batch = icaos.slice(i, i + BATCH);
+    try {
+      const batchResults = await fetchTafBatch(batch, airportByIcao);
+      for (const [code, forecasts] of batchResults) {
+        results.set(code, forecasts);
+      }
+    } catch (err) {
+      console.error(`[Weather] TAF batch ${i}-${i + batch.length} failed after retries:`, (err as Error).message);
+      // Continue with other batches — don't lose data from successful ones
+    }
+  }
+  return results;
+}
 
-  const text = await res.text();
+function parseTafResponse(text: string, airportByIcao: Map<string, { code: string; icao: string }>): Map<string, WeatherRow[]> {
   const results = new Map<string, WeatherRow[]>();
   const now = new Date();
   let currentYear = now.getUTCFullYear();
@@ -468,13 +502,13 @@ export async function fetchAllWeather(): Promise<void> {
   const airportLocations = await fetchAirportLocations(airportCodes);
   await calculateAndStoreDaylight(airportLocations);
   
+  // ── METAR (current conditions) ────────────────────────────────────
+  let metarCount = 0;
   try {
-    // Fetch all METARs in one request
     console.log('[Weather] Fetching METARs...');
     const metars = await fetchAllMetars(airportsList);
     console.log(`[Weather] Received ${metars.size} METARs`);
     
-    // Convert METARs to weather rows
     const metarRows: WeatherRow[] = [];
     const now = new Date();
     
@@ -501,31 +535,35 @@ export async function fetchAllWeather(): Promise<void> {
       console.log(`[Weather] ${airport.code}: ${cloudCover}% cloud, ${data.temp}°C`);
     }
     
-    // Batch insert METARs
-    const metarCount = await batchInsertWeather(metarRows);
+    metarCount = await batchInsertWeather(metarRows);
     console.log(`[Weather] Inserted ${metarCount} METAR records`);
-    
-    // Fetch all TAFs in one request
+  } catch (err) {
+    console.error('[Weather] METAR fetch failed:', err);
+    sendAlert('weather-service', 'warning', 'METAR fetch failed', err).catch(() => {});
+    // Don't throw — TAF may still work
+  }
+
+  // ── TAF (forecasts) ───────────────────────────────────────────────
+  let tafCount = 0;
+  try {
     console.log('[Weather] Fetching TAFs...');
     const tafs = await fetchAllTafs(airportsList);
     console.log(`[Weather] Received TAFs for ${tafs.size} airports`);
     
-    // Flatten all TAF forecasts
     const tafRows: WeatherRow[] = [];
     for (const [, forecasts] of tafs) {
       tafRows.push(...forecasts);
     }
     
-    // Batch insert TAFs
-    const tafCount = await batchInsertWeather(tafRows);
+    tafCount = await batchInsertWeather(tafRows);
     console.log(`[Weather] Inserted ${tafCount} TAF forecast hours`);
-    
-    console.log(`[Weather] Done. Total: ${metarCount} METAR + ${tafCount} TAF records`);
   } catch (err) {
-    console.error('[Weather] Fatal error:', err);
-    sendAlert('weather-service', 'critical', 'fetchAllWeather fatal error', err).catch(() => {});
-    throw err;
+    console.error('[Weather] TAF fetch failed:', err);
+    sendAlert('weather-service', 'warning', 'TAF fetch failed', err).catch(() => {});
+    // TAF is optional — METAR data is what powers the UI
   }
+
+  console.log(`[Weather] Done. Total: ${metarCount} METAR + ${tafCount} TAF records`);
 }
 
 /**
