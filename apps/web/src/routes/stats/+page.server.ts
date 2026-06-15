@@ -190,7 +190,7 @@ export const load: PageServerLoad = async ({ url }) => {
     getWorstDelayDays(filterConfig, 10).catch((e) => { console.error('[Stats] getWorstDelayDays failed:', e); return []; }),
   ]);
 
-  const wxFlightCount = (windDelays.rows as { flights: unknown }[]).reduce(
+  const wxFlightCount = (windDelays as { flights: unknown }[]).reduce(
     (s, r) => s + Number(r.flights),
     0,
   );
