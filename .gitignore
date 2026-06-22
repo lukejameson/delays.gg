@@ -48,3 +48,4 @@ playwright/.cache/
 # Docker
 .docker/
 dist/
+piolium/
