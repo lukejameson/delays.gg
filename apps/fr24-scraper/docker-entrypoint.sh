@@ -12,6 +12,9 @@ else
     exit 1
 fi
 
+# Clean up stale Xvfb lock from previous crashed run
+rm -f /tmp/.X99-lock
+
 # Start Xvfb on display :99 before launching the scraper
 export DISPLAY=:99
 Xvfb :99 -screen 0 1920x1080x24 -ac +extension GLX +render -noreset &
