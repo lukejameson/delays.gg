@@ -1,6 +1,6 @@
 import * as cheerio from 'cheerio';
 import { db, flights, flightStatusHistory, flightTimes, scraperLogs, canUpgradeStatus, routeFlightMinutes, locationToIata, localToUtc, guernseyTodayStr } from '@airways/database';
-import { eq, and, isNull, sql, count, or, isNotNull } from 'drizzle-orm';
+import { eq, and, isNull, sql, count, or, isNotNull, inArray } from 'drizzle-orm';
 
 interface StatusUpdate {
   flightCode: string;
@@ -590,6 +590,29 @@ async function upsertFlight(scrapedFlight: ScrapedFlight): Promise<number | null
 
       // Update the existing record (may have been created by another scraper or a previous guernsey scrape)
       flightId = existing[0].id;
+
+      // Clean up zombie duplicates with the same flight_number + flight_date
+      // but a different id (e.g. legacy LONDONHEA record before locationToIata fix).
+      // ponytail: inline dedup, beats a separate maintenance job.
+      const zombies = await db
+        .select({ id: flights.id })
+        .from(flights)
+        .where(
+          and(
+            eq(flights.flightNumber, primaryCode),
+            eq(flights.flightDate, scrapedFlight.flightDate),
+          ),
+        );
+      if (zombies.length > 1) {
+        const zombieIds = zombies.filter(z => z.id !== flightId).map(z => z.id);
+        if (zombieIds.length > 0) {
+          await db.delete(flightTimes).where(inArray(flightTimes.flightId, zombieIds));
+          await db.delete(flightStatusHistory).where(inArray(flightStatusHistory.flightId, zombieIds));
+          await db.delete(flights).where(inArray(flights.id, zombieIds));
+          console.log(`[Guernsey] Cleaned up ${zombieIds.length} zombie duplicate(s) for ${primaryCode} on ${scrapedFlight.flightDate}`);
+        }
+      }
+
       if (Object.keys(updateSet).length > 1) { // > 1 because updatedAt is always present
         await db
           .update(flights)
@@ -597,28 +620,57 @@ async function upsertFlight(scrapedFlight: ScrapedFlight): Promise<number | null
           .where(eq(flights.id, flightId));
       }
     } else {
-      // No existing record — insert a new one with guernsey unique_id
-      const uniqueId = `${primaryCode}_${scrapedFlight.flightDate}_${departureAirport}_${arrivalAirport}`;
-      const result = await db
-        .insert(flights)
-        .values({
-          uniqueId,
-          flightNumber: primaryCode,
-          airlineCode: airlineCode(primaryCode),
-          departureAirport,
-          arrivalAirport,
-          scheduledDeparture,
-          scheduledArrival,
-          actualDeparture:  sanitizedActualDeparture ?? undefined,
-          actualArrival:    effectiveActualArrival ?? undefined,
-          status:           status ?? undefined,
-          canceled,
-          delayMinutes:     effectiveDelayMinutes ?? undefined,
-          flightDate:       scrapedFlight.flightDate,
-        })
-        .onConflictDoUpdate({ target: flights.uniqueId, set: updateSet as any })
-        .returning({ id: flights.id });
-      flightId = result[0]?.id ?? null;
+      // No exact match — check for legacy records with mismatched departure_airport
+      // (e.g. LONDONHEA before locationToIata was fixed to return LHR).
+      // Ponytail: single extra query to catch this edge case, not a full dedup system.
+      const legacyMatch = await db
+        .select({ id: flights.id, uniqueId: flights.uniqueId, departureAirport: flights.departureAirport })
+        .from(flights)
+        .where(
+          and(
+            eq(flights.flightNumber, primaryCode),
+            eq(flights.flightDate, scrapedFlight.flightDate),
+          ),
+        )
+        .limit(1);
+
+      if (legacyMatch.length > 0 && legacyMatch[0].departureAirport !== departureAirport) {
+        // Repoint the legacy record to the correct airport code and unique_id
+        const newUniqueId = `${primaryCode}_${scrapedFlight.flightDate}_${departureAirport}_${arrivalAirport}`;
+        await db
+          .update(flights)
+          .set({ departureAirport, uniqueId: newUniqueId })
+          .where(eq(flights.id, legacyMatch[0].id));
+        flightId = legacyMatch[0].id;
+        // Apply the rest of the update
+        await db
+          .update(flights)
+          .set(updateSet)
+          .where(eq(flights.id, flightId));
+      } else {
+        // No existing record — insert a new one with guernsey unique_id
+        const uniqueId = `${primaryCode}_${scrapedFlight.flightDate}_${departureAirport}_${arrivalAirport}`;
+        const result = await db
+          .insert(flights)
+          .values({
+            uniqueId,
+            flightNumber: primaryCode,
+            airlineCode: airlineCode(primaryCode),
+            departureAirport,
+            arrivalAirport,
+            scheduledDeparture,
+            scheduledArrival,
+            actualDeparture:  sanitizedActualDeparture ?? undefined,
+            actualArrival:    effectiveActualArrival ?? undefined,
+            status:           status ?? undefined,
+            canceled,
+            delayMinutes:     effectiveDelayMinutes ?? undefined,
+            flightDate:       scrapedFlight.flightDate,
+          })
+          .onConflictDoUpdate({ target: flights.uniqueId, set: updateSet as any })
+          .returning({ id: flights.id });
+        flightId = result[0]?.id ?? null;
+      }
     }
 
     // Write estimated time to flightTimes so the web app can display it.

@@ -560,33 +560,18 @@ async function upsertFR24Flight(
       } else if ((status === 'Airborne' || status === 'Landed') && flight.type === 'departure' && parsedTime <= now) {
         actualDeparture = parsedTime;
       } else {
-        // FR24 "Estimated HH:MM" — treat as a meaningful estimate if it
-        // differs from the scheduled time by more than 5 minutes.
-        // Otherwise it's just FR24's way of saying "on time".
-        const baseTime = flight.type === 'departure' ? scheduledDeparture : scheduledArrival;
-        const diffMs = parsedTime.getTime() - baseTime.getTime();
-        const diffMins = diffMs / 60_000;
-        if (diffMins > 5) {
-          // Estimated time is later than scheduled — flight is delayed
-          estimatedTime = parsedTime;
-          status = 'Delayed';
-        } else if (diffMins < -5) {
-          // Estimated time is earlier than scheduled — flight is early, not delayed
-          estimatedTime = parsedTime;
-          // Keep status as Scheduled (early is not delayed)
-        }
-        // If within ±5 minutes of scheduled, ignore — it's on time
+        // FR24 "Estimated HH:MM" — record the estimated time for display
+        // but do NOT derive status or delay from it. Guernsey scraper owns
+        // status/delay decisions. FR24 estimates are informational only and
+        // frequently differ from scheduled times even for on-time flights.
+        estimatedTime = parsedTime;
       }
     }
   }
 
-  // Compute delay — only from estimated times; guernsey-scraper owns actual departure/arrival
-  let delayMinutes: number | null = null;
-  if (estimatedTime) {
-    const baseTime = flight.type === 'departure' ? scheduledDeparture : scheduledArrival;
-    const diff = Math.round((estimatedTime.getTime() - baseTime.getTime()) / 60_000);
-    if (diff > 5 && diff <= 1440) delayMinutes = diff;
-  }
+  // ponytail: guernsey-scraper owns delay; FR24 estimated times are display-only.
+  // Let flightTimes carry the estimated time, don't set delayMinutes on flights table.
+  const delayMinutes: number | null = null;
 
   try {
     // First check if a flight already exists for this flight_number + flight_date
@@ -633,12 +618,7 @@ async function upsertFR24Flight(
       if (canceled) {
         updateSet.canceled = canceled;
       }
-      // Actual departure/arrival are owned by guernsey-scraper — do not overwrite
-      if (delayMinutes !== null) {
-        updateSet.delayMinutes = delayMinutes;
-      } else if (ex.delayMinutes != null && !isTerminalStatus(ex.status)) {
-        updateSet.delayMinutes = null;
-      }
+      // Status, delay, actual departure/arrival are owned by guernsey-scraper — do not overwrite
       if (detailTimes?.std && detailTimes?.sta) {
         const currentDepMs = ex.scheduledDeparture?.getTime() ?? 0;
         const currentArrMs = ex.scheduledArrival?.getTime() ?? 0;
