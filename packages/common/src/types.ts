@@ -50,6 +50,7 @@ export interface TimerState {
   scrapeTimeout: ReturnType<typeof setTimeout> | null;
   wakeTimeout: ReturnType<typeof setTimeout> | null;
   prefetchSlotTimeout?: ReturnType<typeof setTimeout> | null;
+  tzCheckTimeout?: ReturnType<typeof setTimeout> | null;
 }
 
 /** Scraper log entry structure */

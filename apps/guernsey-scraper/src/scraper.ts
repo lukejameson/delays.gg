@@ -316,10 +316,8 @@ function deriveStatus(updates: StatusUpdate[], scheduledTime: Date): string | nu
       if (!isPreSchedule) return 'Landed';
     } else if (msg.includes('airborne')) {
       if (!isPreSchedule) return 'Airborne';
-    } else if (msg.includes('diverted')) {
-      return updates[i].statusMessage;
-    } else if (msg.includes('diverting')) {
-      return updates[i].statusMessage;
+    } else if (msg.includes('diverted') || msg.includes('diverting')) {
+      return 'Diverted';
     }
   }
 

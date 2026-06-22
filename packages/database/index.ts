@@ -53,6 +53,19 @@ export type NewHistoricalWeather = typeof schema.historicalWeather.$inferInsert;
 
 export type NotificationWatermark = typeof schema.notificationWatermark.$inferSelect;
 export type NewNotificationWatermark = typeof schema.notificationWatermark.$inferInsert;
+export { tryAcquireServiceLock } from './singleton';
+export {
+  clearAllTimers,
+  countFlightsForDate,
+  getActiveFlightsToday,
+  getEstimatedTimesBatch,
+  msSinceLastScrape,
+  logSchedulerEvent,
+  computeNextInterval,
+  shouldSleep,
+  computeWakeTime,
+  type TimerState,
+} from './scheduler';
 export { canUpgradeStatus, isTerminalStatus } from './statusPriority';
 export { ROUTE_FLIGHT_MINUTES, LOCATION_TO_IATA, routeFlightMinutes, locationToIata } from './constants';
 export { GY_TZ, localToUtc, guernseyTodayStr, guernseyTomorrowStr, guernseyHour, nextGuernseyTime, checkTimezoneOffset } from './time';

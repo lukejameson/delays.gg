@@ -1,6 +1,6 @@
 import { loadEnv, CircuitBreaker, createCircuitBreakerFromEnv, TERMINAL_STATUSES, isTerminalStatus, mins, guernseyHour, guernseyTomorrowStr, nextGuernseyTime, type TimerState } from '@airways/common';
 import { scrapeOnce, guernseyDateStr } from './scraper';
-import { db, scraperLogs, flights, flightTimes } from '@airways/database';
+import { db, scraperLogs, flights, flightTimes, tryAcquireServiceLock, clearAllTimers, countFlightsForDate, getActiveFlightsToday, getEstimatedTimesBatch, msSinceLastScrape, logSchedulerEvent, computeNextInterval, shouldSleep, computeWakeTime } from '@airways/database';
 import { sendAlert } from '@airways/telegram';
 import { eq, and, not, inArray, desc, count, max, asc, isNull, sql } from 'drizzle-orm';
 import { resolve, dirname } from 'path';
@@ -38,15 +38,7 @@ const timers: TimerState = {
 
 const circuitBreaker = createCircuitBreakerFromEnv('FR24', 5, 60000);
 
-function clearAllTimers(): void {
-  Object.keys(timers).forEach((key) => {
-    const timerKey = key as keyof TimerState;
-    if (timers[timerKey]) {
-      clearTimeout(timers[timerKey]!);
-      timers[timerKey] = null;
-    }
-  });
-}
+const clearTimers = () => clearAllTimers(timers);
 
 function checkCircuitBreaker(): boolean {
   return circuitBreaker.check();
@@ -58,319 +50,6 @@ function recordFailure(): void {
 
 function recordSuccess(): void {
   circuitBreaker.recordSuccess();
-}
-
-
-
-
-
-
-
-// ---------------------------------------------------------------------------
-// DB helpers
-// ---------------------------------------------------------------------------
-
-async function countFlightsForDate(dateStr: string): Promise<number> {
-  try {
-    const [{ value }] = await db
-      .select({ value: count() })
-      .from(flights)
-      .where(eq(flights.flightDate, dateStr));
-    return value ?? 0;
-  } catch {
-    return 0;
-  }
-}
-
-async function getActiveFlightsToday() {
-  const today = guernseyDateStr();
-  return db
-    .select({
-      id: flights.id,
-      flightNumber: flights.flightNumber,
-      scheduledDeparture: flights.scheduledDeparture,
-      scheduledArrival: flights.scheduledArrival,
-      actualDeparture: flights.actualDeparture,
-      actualArrival: flights.actualArrival,
-      status: flights.status,
-    })
-    .from(flights)
-    .where(
-      and(
-        eq(flights.flightDate, today),
-        eq(flights.canceled, false),
-        not(inArray(flights.status, TERMINAL_STATUSES)),
-      ),
-    );
-}
-
-async function getEstimatedTimesBatch(
-  flightIds: number[],
-): Promise<Map<number, { estDep?: Date; estArr?: Date }>> {
-  const result = new Map<number, { estDep?: Date; estArr?: Date }>();
-  if (flightIds.length === 0) return result;
-  try {
-    const rows = await db
-      .select({ flightId: flightTimes.flightId, timeType: flightTimes.timeType, timeValue: flightTimes.timeValue })
-      .from(flightTimes)
-      .where(
-        and(
-          inArray(flightTimes.flightId, flightIds),
-          inArray(flightTimes.timeType, ['EstimatedBlockOff', 'EstimatedBlockOn']),
-        ),
-      );
-    for (const row of rows) {
-      const entry = result.get(row.flightId) ?? {};
-      if (row.timeType === 'EstimatedBlockOff') entry.estDep = new Date(row.timeValue);
-      if (row.timeType === 'EstimatedBlockOn') entry.estArr = new Date(row.timeValue);
-      result.set(row.flightId, entry);
-    }
-  } catch {
-    // Return empty map on error
-  }
-  return result;
-}
-
-// ---------------------------------------------------------------------------
-// Scheduler event logger
-// ---------------------------------------------------------------------------
-
-async function logSchedulerEvent(type: 'sleep' | 'wake', detail: string): Promise<void> {
-  try {
-    const label = type === 'sleep' ? 'SLEEP' : 'WAKE';
-    await db.insert(scraperLogs).values({
-      service: 'fr24_live',
-      status: 'success',
-      recordsScraped: 0,
-      errorMessage: `[${label}] ${detail}`,
-      startedAt: new Date(),
-      completedAt: new Date(),
-    });
-    console.log(`[FR24] [${label}] ${detail}`);
-  } catch (err) {
-    console.error('[FR24] Failed to write scheduler event to DB:', err);
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Dynamic interval calculation
-// ---------------------------------------------------------------------------
-
-async function computeNextInterval(): Promise<{ ms: number; jitterMs: number; reason: string }> {
-  const activeFlights = await getActiveFlightsToday();
-
-  if (activeFlights.length === 0) {
-    return {
-      ms: INTERVAL_IDLE_MS,
-      jitterMs: Math.floor(Math.random() * 90_000),
-      reason: 'No active flights today — idle frequency',
-    };
-  }
-
-  const now = Date.now();
-  let soonestEventMs = Infinity;
-  let soonestFlight = '';
-
-  const estimatedTimesMap = await getEstimatedTimesBatch(activeFlights.map(f => f.id));
-
-  for (const f of activeFlights) {
-    const { estDep, estArr } = estimatedTimesMap.get(f.id) ?? {};
-    let nextEventMs: number | null = null;
-
-    if (!f.actualDeparture) {
-      const depTime = estDep ?? f.scheduledDeparture;
-      if (depTime) nextEventMs = new Date(depTime).getTime();
-    } else if (!f.actualArrival) {
-      const arrTime = estArr ?? f.scheduledArrival;
-      if (arrTime) nextEventMs = new Date(arrTime).getTime();
-    }
-
-    if (nextEventMs !== null && nextEventMs < soonestEventMs) {
-      soonestEventMs = nextEventMs;
-      soonestFlight = f.flightNumber;
-    }
-  }
-
-  if (soonestEventMs === Infinity) {
-    return {
-      ms: INTERVAL_IDLE_MS,
-      jitterMs: Math.floor(Math.random() * 90_000),
-      reason: `${activeFlights.length} active flight(s) but no upcoming event times found — idle frequency`,
-    };
-  }
-
-  const minsUntil = (soonestEventMs - now) / 60_000;
-
-  if (minsUntil < 20) {
-    return {
-      ms: INTERVAL_HIGH_MS,
-      jitterMs: Math.floor(Math.random() * 15_000),
-      reason: `${minsUntil.toFixed(0)}m until ${soonestFlight} event — high frequency (2 min)`,
-    };
-  }
-  if (minsUntil < 60) {
-    return {
-      ms: INTERVAL_MEDIUM_MS,
-      jitterMs: Math.floor(Math.random() * 30_000),
-      reason: `${minsUntil.toFixed(0)}m until ${soonestFlight} event — medium frequency (5 min)`,
-    };
-  }
-  if (minsUntil < 120) {
-    return {
-      ms: INTERVAL_LOW_MS,
-      jitterMs: Math.floor(Math.random() * 60_000),
-      reason: `${minsUntil.toFixed(0)}m until ${soonestFlight} event — low frequency (10 min)`,
-    };
-  }
-  return {
-    ms: INTERVAL_IDLE_MS,
-    jitterMs: Math.floor(Math.random() * 90_000),
-    reason: `${minsUntil.toFixed(0)}m until ${soonestFlight} event — idle frequency (15 min)`,
-  };
-}
-
-// ---------------------------------------------------------------------------
-// Sleep / wake decision
-// ---------------------------------------------------------------------------
-
-async function shouldSleep(): Promise<{ sleep: boolean; reason: string }> {
-  const currentHour = guernseyHour();
-
-  if (currentHour >= CUTOFF_HOUR) {
-    return {
-      sleep: true,
-      reason: `Hard cutoff — Guernsey local hour ${currentHour} >= ${CUTOFF_HOUR}`,
-    };
-  }
-
-  const today = guernseyDateStr();
-  const totalToday = await countFlightsForDate(today);
-
-  if (totalToday === 0) {
-    return { sleep: false, reason: '' };
-  }
-
-  const activeFlights = await getActiveFlightsToday();
-  if (activeFlights.length === 0) {
-    try {
-      const [{ lastUpdate }] = await db
-        .select({ lastUpdate: max(flights.updatedAt) })
-        .from(flights)
-        .where(eq(flights.flightDate, today));
-
-      const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000);
-      if (!lastUpdate || new Date(lastUpdate) < twoHoursAgo) {
-        return {
-          sleep: false,
-          reason: `All flights appear terminal but data is stale — scraping to refresh`,
-        };
-      }
-    } catch {
-      return { sleep: false, reason: 'Could not verify data freshness — staying active' };
-    }
-
-    return {
-      sleep: true,
-      reason: `All ${totalToday} flights for ${today} are in terminal status`,
-    };
-  }
-
-  return { sleep: false, reason: '' };
-}
-
-// ---------------------------------------------------------------------------
-// Wake time calculation
-// ---------------------------------------------------------------------------
-
-async function computeWakeTime(): Promise<{ wakeAt: Date; reason: string }> {
-  const now = new Date();
-  const today = guernseyDateStr();
-
-  if (guernseyHour() < CUTOFF_HOUR) {
-    try {
-      const activeToday = await getActiveFlightsToday();
-      if (activeToday.length > 0) {
-        const upcoming = activeToday
-          .filter(f => f.scheduledDeparture != null)
-          .map(f => new Date(f.scheduledDeparture!).getTime())
-          .filter(t => t > now.getTime())
-          .sort((a, b) => a - b);
-
-        if (upcoming.length > 0) {
-          const wakeAt = new Date(upcoming[0] - WAKE_OFFSET_MINS * 60_000);
-          if (wakeAt > now) {
-            return {
-              wakeAt,
-              reason: `${WAKE_OFFSET_MINS}m before next flight on ${today}`,
-            };
-          }
-          return {
-            wakeAt: now,
-            reason: `Active flights on ${today} need tracking but wake time already passed — waking now`,
-          };
-        }
-
-        return {
-          wakeAt: now,
-          reason: `Airborne/in-progress flights on ${today} need tracking — waking now`,
-        };
-      }
-    } catch (err) {
-      console.error('[FR24] Error querying today\'s flights for wake time:', err);
-    }
-  }
-
-  const tomorrow = guernseyTomorrowStr();
-  const totalTomorrow = await countFlightsForDate(tomorrow);
-
-  if (totalTomorrow > 0) {
-    try {
-      const [firstFlight] = await db
-        .select({ scheduledDeparture: flights.scheduledDeparture })
-        .from(flights)
-        .where(eq(flights.flightDate, tomorrow))
-        .orderBy(flights.scheduledDeparture)
-        .limit(1);
-
-      if (firstFlight?.scheduledDeparture) {
-        const firstDepMs = new Date(firstFlight.scheduledDeparture).getTime();
-        const wakeAt = new Date(firstDepMs - WAKE_OFFSET_MINS * 60_000);
-        if (wakeAt > now) {
-          return {
-            wakeAt,
-            reason: `${WAKE_OFFSET_MINS}m before first flight on ${tomorrow}`,
-          };
-        }
-      }
-    } catch (err) {
-      console.error('[FR24] Error querying first flight for wake time:', err);
-    }
-  }
-
-  const fallback = nextGuernseyTime(5, 0);
-  return {
-    wakeAt: fallback,
-    reason: `No tomorrow schedule found — falling back to 05:00 Guernsey`,
-  };
-}
-
-// ---------------------------------------------------------------------------
-// State machine
-// ---------------------------------------------------------------------------
-
-async function msSinceLastScrape(): Promise<number> {
-  try {
-    const [last] = await db
-      .select({ completedAt: scraperLogs.completedAt })
-      .from(scraperLogs)
-      .where(eq(scraperLogs.service, 'fr24_live'))
-      .orderBy(desc(scraperLogs.completedAt))
-      .limit(1);
-    if (!last?.completedAt) return Infinity;
-    return Date.now() - new Date(last.completedAt).getTime();
-  } catch {
-    return Infinity;
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -519,21 +198,22 @@ async function runScrape(label: string): Promise<void> {
 }
 
 async function scheduleNextScrape(): Promise<void> {
-  const { sleep, reason } = await shouldSleep();
+  const todayStr = guernseyDateStr();
+  const { sleep, reason } = await shouldSleep(todayStr, CUTOFF_HOUR, guernseyHour());
 
   if (sleep) {
-    await logSchedulerEvent('sleep', reason);
+    await logSchedulerEvent('fr24_live', 'sleep', reason);
 
-    const { wakeAt, reason: wakeReason } = await computeWakeTime();
+    const { wakeAt, reason: wakeReason } = await computeWakeTime(todayStr, guernseyTomorrowStr(), guernseyHour(), CUTOFF_HOUR, WAKE_OFFSET_MINS);
     const sleepMs = Math.max(0, wakeAt.getTime() - Date.now());
 
-    await logSchedulerEvent('sleep', `Sleeping for ${Math.round(sleepMs / 60_000)}m. ${wakeReason}`);
+    await logSchedulerEvent('fr24_live', 'sleep', `Sleeping for ${Math.round(sleepMs / 60_000)}m. ${wakeReason}`);
     console.log(`[FR24] Setting wake timeout: will fire in ${Math.round(sleepMs / 1000)}s at ${wakeAt.toISOString()}`);
 
     timers.wakeTimeout = setTimeout(async () => {
       try {
         timers.wakeTimeout = null;
-        await logSchedulerEvent('wake', `Waking up — ${wakeReason}`);
+        await logSchedulerEvent('fr24_live', 'wake', `Waking up — ${wakeReason}`);
         await runScrape('Post-sleep scrape');
         await scheduleNextScrape();
       } catch (err) {
@@ -556,7 +236,7 @@ async function scheduleNextScrape(): Promise<void> {
     return;
   }
 
-  const { ms, jitterMs, reason: intervalReason } = await computeNextInterval();
+  const { ms, jitterMs, reason: intervalReason } = await computeNextInterval(guernseyDateStr(), INTERVAL_HIGH_MS, INTERVAL_MEDIUM_MS, INTERVAL_LOW_MS, INTERVAL_IDLE_MS);
   const totalMs = ms + jitterMs;
 
   console.log(
@@ -594,6 +274,14 @@ async function scheduleNextScrape(): Promise<void> {
 // ---------------------------------------------------------------------------
 
 async function main() {
+  // Prevent duplicate instances via PostgreSQL advisory lock.
+  // If another fr24_live process already holds the lock, exit immediately.
+  const acquired = await tryAcquireServiceLock('fr24_live');
+  if (!acquired) {
+    console.log('[FR24] Another instance is already running (lock held). Exiting.');
+    process.exit(0);
+  }
+
   console.log('[FR24] Scraper service starting...');
   console.log(`[FR24] Config — cutoff: ${CUTOFF_HOUR}:00 GY, wake offset: ${WAKE_OFFSET_MINS}m`);
   console.log(`[FR24] Intervals — high: ${INTERVAL_HIGH_MS / 1000}s, medium: ${INTERVAL_MEDIUM_MS / 1000}s, low: ${INTERVAL_LOW_MS / 1000}s, idle: ${INTERVAL_IDLE_MS / 1000}s`);
@@ -606,8 +294,8 @@ async function main() {
     console.log(`[FR24] Startup during sleep window (Guernsey hour: ${currentHour}) — going straight to sleep state`);
     await scheduleNextScrape();
   } else {
-    const elapsed = await msSinceLastScrape();
-    const { ms: nextMs } = await computeNextInterval();
+    const elapsed = await msSinceLastScrape('fr24_live');
+    const { ms: nextMs } = await computeNextInterval(guernseyDateStr(), INTERVAL_HIGH_MS, INTERVAL_MEDIUM_MS, INTERVAL_LOW_MS, INTERVAL_IDLE_MS);
 
     if (elapsed === Infinity) {
       console.log('[FR24] No previous scrape found — running immediately');
@@ -634,24 +322,24 @@ async function main() {
 
 process.on('SIGTERM', () => {
   console.log('[FR24] SIGTERM received, cleaning up...');
-  clearAllTimers();
+  clearTimers();
   process.exit(0);
 });
 
 process.on('SIGINT', () => {
   console.log('[FR24] SIGINT received, cleaning up...');
-  clearAllTimers();
+  clearTimers();
   process.exit(0);
 });
 
 process.on('uncaughtException', (err) => {
   console.error('[FR24] Uncaught exception:', err);
-  clearAllTimers();
+  clearTimers();
   sendAlert('fr24-scraper', 'critical', 'Uncaught exception', err).finally(() => process.exit(1));
 });
 
 main().catch(err => {
   console.error('[FR24] Fatal startup error:', err);
-  clearAllTimers();
+  clearTimers();
   sendAlert('fr24-scraper', 'critical', 'Fatal startup error', err).finally(() => process.exit(1));
 });

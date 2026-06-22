@@ -201,7 +201,8 @@ async function extractFlightRows(page: Page, type: 'arrival' | 'departure', targ
         if (!/\d{1,2}:\d{2}/.test(scheduledTime)) return;
 
         const iataMatch = originDest.match(/\(([A-Z]{3})\)/);
-        const iataCode = iataMatch ? iataMatch[1] : originDest.replace(/[^A-Z]/g, '').slice(0, 3);
+        const iataCode = iataMatch ? iataMatch[1] : null;
+        if (!iataCode) return; // Skip rows where we can't extract a proper IATA code
 
         const timeMatch = statusText.match(/(\d{1,2}:\d{2}\s*(?:AM|PM)?)/i);
         const actualEstTime = timeMatch ? timeMatch[1] : null;
@@ -379,7 +380,7 @@ async function clickLoadEarlierFlights(page: Page): Promise<void> {
  * estimated time vs scheduled time to determine if the flight is actually delayed.
  */
 function normalizeStatus(rawStatus: string): string {
-  const s = rawStatus.toLowerCase();
+  const s = rawStatus.trim().toLowerCase();
   if (s.includes('landed')) return 'Landed';
   if (s.includes('cancelled') || s.includes('canceled')) return 'Cancelled';
   if (s.includes('diverted')) return 'Diverted';
@@ -391,7 +392,7 @@ function normalizeStatus(rawStatus: string): string {
   if (s.includes('arrived')) return 'Landed';
   // FR24 "Estimated HH:MM" / "Expected HH:MM" = on time unless proven otherwise
   if (s.includes('estimated') || s.includes('expected')) return 'Scheduled';
-  return rawStatus || 'Scheduled';
+  return rawStatus.trim() || 'Scheduled';
 }
 
 // ---------------------------------------------------------------------------
@@ -864,6 +865,9 @@ async function runBrowserSession(
         title = await page.title().catch(() => '');
         waitAttempts++;
       }
+      if (title.includes('Just a moment')) {
+        throw new Error('Cloudflare challenge not bypassed after 10 attempts — browser fingerprint may need updating');
+      }
 
       // Wait for table to render
       console.log('[FR24] Waiting for flight table to render...');
@@ -907,6 +911,9 @@ async function runBrowserSession(
         await randomDelay(5000, 10000);
         title = await page.title().catch(() => '');
         waitAttempts++;
+      }
+      if (title.includes('Just a moment')) {
+        throw new Error('Cloudflare challenge not bypassed on departures page after 10 attempts');
       }
 
       await page.waitForSelector('table', { timeout: 30000 }).catch(() => {

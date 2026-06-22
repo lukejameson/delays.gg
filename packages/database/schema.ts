@@ -173,6 +173,7 @@ export const scraperLogs = pgTable('scraper_logs', {
   recordsScraped: integer('records_scraped').default(0),
   errorMessage: text('error_message'),
   retryCount: integer('retry_count').default(0),
+  eventType: text('event_type'),
   startedAt: timestamp('started_at').notNull(),
   completedAt: timestamp('completed_at'),
 }, (table) => [

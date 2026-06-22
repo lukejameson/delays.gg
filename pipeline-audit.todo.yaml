@@ -1,0 +1,125 @@
+# todo.yaml — single source of truth for LLM
+# Updated: 2026-06-15T09:30:00Z
+
+goal: >
+  Harden the airways.gg data pipeline by fixing 11 identified issues: duplicate
+  scraper instances, FR24 failures, inconsistent statuses, duplicate flights,
+  missing route data, display bugs, and tooling defects.
+
+why_how: >
+  The pipeline ingests data from airport.gg (HTML/JSON) and FlightRadar24
+  (browser scraper). Issues range from duplicate Docker instances producing
+  duplicate log entries, to 29 inconsistent diversion status strings, to a
+  broken weather API tool. The plan follows the research brief's recommended
+  ordering: infrastructure fixes first, then scraper reliability, then data
+  normalization, then dedup, route gaps, and finally display/tooling bugs.
+  User decisions: normalize diversion statuses in-place (no schema change),
+  add 24-hour TTL for aircraft_positions, extract shared scheduler logic
+  from the two scrapers into @airways/common.
+
+expected: >
+  All 11 issues resolved. No duplicate scraper instances. FR24 scraper
+  recovers from Cloudflare challenges without manual intervention. All
+  diversion statuses normalized to "Diverted". BA1344 duplicate removed
+  and prevented. BRS/EXT/LCY flights populated with status and aircraft.
+  Delay display shows "-7m" not "+-7m". airways_weather tool works.
+  Tomorrow's flights don't leak into today's unfiltered API. Shared
+  scheduler logic in @airways/common. Positions cleaned up after 24h.
+
+status: in_progress
+
+tasks:
+  - phase: 1
+    name: Infrastructure Fixes
+    status: complete
+    items:
+      - done: true
+        action: Fix duplicate guernsey_live instances by adding a startup lock (advisory lock or singleton pattern) to prevent concurrent process execution
+      - done: true
+        action: Add docker-compose health check with start_period to prevent rapid restart loops on scraper containers
+      - done: true
+        action: Extract shared scheduler logic from guernsey-scraper/src/live.ts and fr24-scraper/src/index.ts into @airways/common (dynamic intervals, sleep/wake, circuit breaker, timer state, countFlightsForDate, getActiveFlightsToday, getEstimatedTimesBatch)
+      - done: true
+        action: Refactor both scrapers to use the extracted common scheduler module
+
+  - phase: 2
+    name: Scraper Reliability
+    status: complete
+    items:
+      - done: true
+        action: Add exponential backoff with jitter to FR24 scraper retry loop (already partially exists — verify and strengthen)
+      - done: true
+        action: Add Cloudflare challenge timeout detection — if browser title is "Just a moment" for >10 attempts, log a distinct failure reason instead of silent retry
+      - done: true
+        action: Add scraper_logs event_type column (scheduler_event vs error) — split the overloaded error_message field that currently stores both [SLEEP]/[WAKE]/[PREFETCH] labels and actual errors
+      - done: true
+        action: Update both scrapers to write scheduler events with the new event_type column
+      - done: true
+        action: Add test for FR24 status normalization (normalizeStatus function)
+
+  - phase: 3
+    name: Data Normalization
+    status: complete
+    items:
+      - done: true
+        action: Normalize all 29 diversion status strings to "Diverted" with a SQL migration UPDATE
+      - done: true
+        action: Fix deriveStatus() in guernsey-scraper to return "Diverted" instead of raw diversion messages
+      - done: true
+        action: Normalize "Landed HH:MM" status strings — strip the embedded time, keep just "Landed"
+      - done: true
+        action: Add a status constraint or trigger to prevent future free-text diversion variants (check constraint on status column for known values, or a status validation helper)
+      - done: true
+        action: Fix FR24 scraper to extract proper IATA codes from airport names (currently writes "LONDONHEA" instead of "LHR")
+      - done: true
+        action: Add test for deriveStatus covering all diversion variants
+
+  - phase: 4
+    name: Deduplication
+    status: pending
+    items:
+      - done: false
+        action: Write one-shot dedup SQL script to remove BA1344_2026-06-15 duplicate (keep id=42593 LHR→GCI, delete id=42574 LONDONHEA→GCI) — DRY RUN FIRST
+      - done: false
+        action: Add unique constraint or upsert logic to prevent future duplicates where flight_number + flight_date + departure_airport collide across scrapers
+      - done: false
+        action: Fix FR24 upsertFR24Flight to validate departure/arrival airport against airports table (reject non-IATA codes like "LONDONHEA")
+
+  - phase: 5
+    name: Route Data Gaps
+    status: pending
+    items:
+      - done: false
+        action: Investigate why BRS and EXT routes have NULL status/registration — check if locationToIata() mappings are missing or airport.gg HTML parsing doesn't cover these routes
+      - done: false
+        action: Add missing location → IATA mappings for BRS, EXT, and any other uncovered routes
+      - done: false
+        action: Investigate why GR400/GR401 (LCY) have NULL status — check if airport.gg API returns data for these flights
+      - done: false
+        action: If airport.gg doesn't cover BRS/EXT/LCY, add FR24 scraper as fallback data source for status and registration on these routes
+      - done: false
+        action: Backfill NULL status for any flight from the last 7 days that FR24 can provide data for
+
+  - phase: 6
+    name: Display & Tooling Fixes
+    status: pending
+    items:
+      - done: false
+        action: Fix delay display formatting — change rendering to show "-7m" instead of "+-7m" for negative delays
+      - done: false
+        action: Fix airways_weather tool — update table reference from "weather" to "weather_data"
+      - done: false
+        action: Fix /api/debug/flights to filter by flight_date = today (or add date param) — prevents tomorrow's prefetched flights from leaking into results
+      - done: false
+        action: Fix /api/debug/positions to deduplicate by registration — return only the latest position per aircraft (DISTINCT ON pattern)
+      - done: false
+        action: Add 24-hour TTL retention policy for aircraft_positions — a periodic DELETE or a startup cleanup query in position-service
+
+notes:
+  - The scraping infrastructure fix (phase 1) may require docker-compose changes that need deployment coordination
+  - Status normalization migration must run during off-peak hours (23:00-05:00 GY)
+  - BA1344 dedup must be a dry-run first to confirm no data loss
+  - Phase 5 (route gaps) may require reverse-engineering the airport.gg API to understand which routes it covers
+  - The shared scheduler extraction touches both scrapers — coordinate testing carefully
+
+discovered: []
